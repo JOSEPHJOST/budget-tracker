@@ -30,7 +30,14 @@ npm install
 npm run dev     # serveur local
 npm test        # tests de la logique (src/lib)
 npm run lint
-npm run deploy  # build + GitHub Pages
 ```
 
 Logique pure dans `src/lib/` (testée), composants dans `src/components/`.
+
+## Mise en ligne
+
+Chaque fusion dans `main` est vérifiée (lint, tests, build) puis publiée automatiquement sur
+https://josephjost.github.io/budget-tracker par GitHub Actions (`.github/workflows/deploy.yml`).
+Les pull requests sont vérifiées sans être publiées.
+
+Réglage à faire une seule fois : **Settings → Pages → Source : GitHub Actions**.
