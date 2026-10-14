@@ -1,236 +1,154 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import {
+  THRESHOLD, MONTH_NAMES, round10, fmt, DEFAULT_FIXED, REDIST_CATS, PALETTE, SOURCE_ICONS, computeMonth,
+} from "./lib/budget.js";
+import { computeForecast } from "./lib/forecast.js";
+import { parseQuickEntry, learn } from "./lib/smartParse.js";
+import {
+  loadMonth, saveMonth, listMonths, loadLearned, saveLearned, loadGoals, saveGoals, exportAll, importAll,
+} from "./lib/storage.js";
+import { g } from "./components/styles.js";
+import { ArcGauge, Bar } from "./components/ui.jsx";
+import PulseCard from "./components/PulseCard.jsx";
+import SimulatorModal from "./components/SimulatorModal.jsx";
+import GoalsTab from "./components/GoalsTab.jsx";
 
-const THRESHOLD = 2200;
-const MONTH_NAMES = ["Janvier","Février","Mars","Avril","Mai","Juin",
-  "Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
-
-const round10 = v => Math.round(v / 10) * 10;
-const KEY = (y, m) => `bgt_v5_${y}_${m}`;
-
-const DEFAULT_FIXED = [
-  { id: "spotify",   label: "Spotify",        icon: "🎵", amount: 70,  color: "#1DB954", deletable: false },
-  { id: "sport",     label: "Salle de sport", icon: "🥊", amount: 250, color: "#4CAF7D", deletable: false },
-  { id: "transport", label: "Transport",      icon: "🚗", amount: 400, color: "#7B8CDE", deletable: false },
-];
-
-const VAR_CATS = [
-  { id: "epargne",  label: "Épargne",           icon: "🏦", color: "#C9A84C", std: 0.27, red: 0.18 },
-  { id: "food",     label: "Nourriture / Cafés", icon: "🍽️", color: "#E07B4C", std: 0.20, red: 0.32 },
-  { id: "divers",   label: "Imprévus",           icon: "🔧", color: "#8888AA", std: 0.13, red: 0.18 },
-  { id: "devperso", label: "Dev perso",           icon: "📚", color: "#9B59B6", std: 0.10, red: 0.10 },
-  { id: "sorties",  label: "Sorties / Amie",     icon: "🎯", color: "#E05599", std: 0.30, red: 0.22 },
-];
-
-// Catégories qui reçoivent la redistribution (hors épargne)
-const REDIST_CATS = VAR_CATS.filter(c => c.id !== "epargne");
-
-const PALETTE = ["#E05555","#E07B4C","#C9A84C","#4CAF7D","#7B8CDE","#E05599","#9B59B6","#1DB954","#8888AA"];
-const SOURCE_ICONS = { "inDrive":"🚗", "Trading":"📈", "Freelance":"💻", "Autre":"💸" };
-
-// ─── Calcul redistribution revenu externe ────────────────────────────────────
-function computeExternal(externalRevenues, isReduced) {
-  const total = externalRevenues.reduce((s, r) => s + r.amount, 0);
-  const toEpargne = round10(total * 0.5);
-  const toRedist  = total * 0.5;
-
-  // Poids normalisés des catégories hors épargne
-  const weights = REDIST_CATS.map(c => isReduced ? c.red : c.std);
-  const sumW    = weights.reduce((s, w) => s + w, 0);
-
-  const redistMap = {};
-  REDIST_CATS.forEach((c, i) => {
-    redistMap[c.id] = round10(toRedist * (weights[i] / sumW));
-  });
-  redistMap["epargne"] = toEpargne;
-
-  return { total, toEpargne, toRedist: round10(toRedist), redistMap };
-}
-
-// ─── ARC GAUGE ───────────────────────────────────────────────────────────────
-function ArcGauge({ pct }) {
-  const r = 52, cx = 64, cy = 64, sa = -210, sw = 240;
-  const rad = d => d * Math.PI / 180;
-  const pt  = a => ({ x: cx + r * Math.cos(rad(a)), y: cy + r * Math.sin(rad(a)) });
-  const ep  = Math.min(pct, 1);
-  const e   = pt(sa + sw * ep);
-  const col = pct > 0.9 ? "#E05555" : pct > 0.7 ? "#E07B4C" : "#C9A84C";
-  return (
-    <svg width="120" height="96" viewBox="0 0 128 90">
-      <path d={`M ${pt(sa).x} ${pt(sa).y} A ${r} ${r} 0 1 1 ${pt(sa+sw).x} ${pt(sa+sw).y}`}
-        fill="none" stroke="#1E1E30" strokeWidth="9" strokeLinecap="round"/>
-      {ep > 0 && <path d={`M ${pt(sa).x} ${pt(sa).y} A ${r} ${r} 0 ${sw*ep>180?1:0} 1 ${e.x} ${e.y}`}
-        fill="none" stroke={col} strokeWidth="9" strokeLinecap="round"/>}
-    </svg>
-  );
-}
-
-function Bar({ pct, color }) {
-  const c = pct > 1 ? "#E05555" : pct > 0.8 ? "#E07B4C" : color;
-  return (
-    <div style={{ height:5, background:"#1E1E30", borderRadius:99, overflow:"hidden", marginTop:8 }}>
-      <div style={{ height:"100%", width:`${Math.min(pct*100,100)}%`, background:c, borderRadius:99, transition:"width 0.4s" }}/>
-    </div>
-  );
-}
+const EMPTY_EXP_FORM = { quick:"", amount:"", catId:"food", note:"", guess:null, catTouched:false };
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function App() {
   const now = new Date();
   const [year,  setYear]  = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth());
-  const [income, setIncome]       = useState(THRESHOLD);
+  const [data, setData] = useState(() => loadMonth(now.getFullYear(), now.getMonth()));
+  const [learned, setLearned] = useState(loadLearned);
+  const [goals, setGoals]     = useState(loadGoals);
   const [editingIncome, setEditingIncome] = useState(false);
   const [tempIncome, setTempIncome]       = useState("");
-  const [fixedCustom, setFixedCustom]     = useState([]);
-  const [expenses, setExpenses]           = useState([]);
-  const [externalRevenues, setExternalRevenues] = useState([]);
   const [tab, setTab] = useState("budget");
   const [showAddExp,   setShowAddExp]   = useState(false);
   const [showAddFixed, setShowAddFixed] = useState(false);
   const [showAddExt,   setShowAddExt]   = useState(false);
-  const [form,   setForm]   = useState({ amount:"", catId:"food", note:"" });
+  const [showSim,      setShowSim]      = useState(false);
+  const [form,   setForm]   = useState(EMPTY_EXP_FORM);
   const [fxForm, setFxForm] = useState({ label:"", amount:"", icon:"💳", color:"#7B8CDE" });
   const [extForm, setExtForm] = useState({ amount:"", source:"inDrive", customSource:"" });
+  const [backupMsg, setBackupMsg] = useState(null);
+  const fileRef = useRef(null);
 
-  const storageKey = KEY(year, month);
+  useEffect(() => { setData(loadMonth(year, month)); }, [year, month]);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      if (raw) {
-        const d = JSON.parse(raw);
-        setIncome(d.income ?? THRESHOLD);
-        setFixedCustom(d.fixedCustom ?? []);
-        setExpenses(d.expenses ?? []);
-        setExternalRevenues(d.externalRevenues ?? []);
-      } else {
-        setIncome(THRESHOLD); setFixedCustom([]); setExpenses([]); setExternalRevenues([]);
-      }
-    } catch {
-      setIncome(THRESHOLD); setFixedCustom([]); setExpenses([]); setExternalRevenues([]);
-    }
-  }, [storageKey]);
-
-  const persist = (inc, fc, exp, ext) =>
-    localStorage.setItem(storageKey, JSON.stringify({ income:inc, fixedCustom:fc, expenses:exp, externalRevenues:ext }));
+  const { income, fixedCustom, expenses, externalRevenues } = data;
+  const update = patch => {
+    const next = { ...data, ...patch, inherited:false };
+    setData(next);
+    saveMonth(year, month, next);
+  };
 
   // ── Budget logic ─────────────────────────────────────────────────────────
-  const isReduced   = income < THRESHOLD;
-  const allFixed    = [...DEFAULT_FIXED, ...fixedCustom];
-  const totalFixed  = allFixed.reduce((s, f) => s + f.amount, 0);
-  const available   = Math.max(income - totalFixed, 0);
-
-  const varBudgets = VAR_CATS.map(c => ({
-    ...c,
-    budget: round10(available * (isReduced ? c.red : c.std)),
-  }));
-
-  const { total: extTotal, toEpargne, toRedist, redistMap } =
-    computeExternal(externalRevenues, isReduced);
-
-  // Budget effectif = budget de base + bonus externe
-  const allCats = [
-    ...allFixed.map(f => ({ ...f, type:"fixed", budget:f.amount, bonus:0 })),
-    ...varBudgets.map(v => ({
-      ...v, type:"variable",
-      bonus: redistMap[v.id] || 0,
-      budget: v.budget + (redistMap[v.id] || 0),
-    })),
-  ];
-
-  const spentMap = allCats.reduce((acc, c) => {
-    acc[c.id] = expenses.filter(e => e.catId === c.id).reduce((s, e) => s + e.amount, 0);
-    return acc;
-  }, {});
-
-  const totalBudget = allCats.reduce((s, c) => s + c.budget, 0);
-  const totalSpent  = Object.values(spentMap).reduce((s, v) => s + v, 0);
-  const totalIncome = income + extTotal;
-  const restant     = totalIncome - totalSpent;
-  const gaugePct    = totalBudget > 0 ? Math.min(totalSpent / totalBudget, 1.2) : 0;
+  const {
+    isReduced, allFixed, totalFixed, available, varBudgets, allCats, spentMap,
+    totalBudget, totalSpent, restant, extTotal, toEpargne, toRedist, redistMap,
+  } = computeMonth(data);
+  const gaugePct = totalBudget > 0 ? Math.min(totalSpent / totalBudget, 1.2) : 0;
+  const forecast = computeForecast({ allCats, spentMap, expenses, year, month, today: now });
+  const paceMarker = forecast.period === "current" ? forecast.day / forecast.daysInMonth : null;
 
   // ── Handlers ─────────────────────────────────────────────────────────────
   const confirmIncome = () => {
     const v = Number(tempIncome);
-    if (v > 0) { setIncome(v); persist(v, fixedCustom, expenses, externalRevenues); }
+    if (v > 0) update({ income:v });
     setEditingIncome(false);
+  };
+
+  // Une dépense saisie sur un autre mois que le mois courant est datée dans ce mois-là
+  const entryDate = () => forecast.period === "current"
+    ? new Date().toISOString()
+    : new Date(year, month, forecast.period === "past" ? forecast.daysInMonth : 1, 12).toISOString();
+
+  const onQuickChange = text => {
+    const p = parseQuickEntry(text, learned, allCats.map(c => c.id));
+    setForm(f => ({
+      ...f,
+      quick: text,
+      amount: p.amount != null ? String(p.amount) : f.amount,
+      note: p.note,
+      catId: !f.catTouched && p.catId ? p.catId : f.catId,
+      guess: !f.catTouched && p.catId ? p.source : f.catTouched ? f.guess : null,
+    }));
+  };
+
+  const openExpense = (prefill = {}) => {
+    setForm({ ...EMPTY_EXP_FORM, ...prefill });
+    setShowAddExp(true);
   };
 
   const addExpense = () => {
     if (!form.amount || Number(form.amount) <= 0) return;
-    const e = { id:Date.now(), amount:Number(form.amount), catId:form.catId, note:form.note, date:new Date().toISOString() };
-    const updated = [e, ...expenses];
-    setExpenses(updated);
-    persist(income, fixedCustom, updated, externalRevenues);
-    setForm({ amount:"", catId:"food", note:"" });
+    const e = { id:Date.now(), amount:Number(form.amount), catId:form.catId, note:form.note.trim(), date:entryDate() };
+    update({ expenses:[e, ...expenses] });
+    if (e.note) {
+      const l = learn(learned, e.note, e.catId);
+      setLearned(l);
+      saveLearned(l);
+    }
+    setForm(EMPTY_EXP_FORM);
     setShowAddExp(false);
   };
 
-  const delExpense = id => {
-    const updated = expenses.filter(e => e.id !== id);
-    setExpenses(updated);
-    persist(income, fixedCustom, updated, externalRevenues);
-  };
+  const delExpense = id => update({ expenses: expenses.filter(e => e.id !== id) });
 
   const addFixed = () => {
     if (!fxForm.label || Number(fxForm.amount) <= 0) return;
     const f = { id:`fx_${Date.now()}`, label:fxForm.label, icon:fxForm.icon, amount:Number(fxForm.amount), color:fxForm.color, deletable:true };
-    const updated = [...fixedCustom, f];
-    setFixedCustom(updated);
-    persist(income, updated, expenses, externalRevenues);
+    update({ fixedCustom:[...fixedCustom, f] });
     setFxForm({ label:"", amount:"", icon:"💳", color:"#7B8CDE" });
     setShowAddFixed(false);
   };
 
-  const delFixed = id => {
-    const upFC  = fixedCustom.filter(f => f.id !== id);
-    const upExp = expenses.filter(e => e.catId !== id);
-    setFixedCustom(upFC); setExpenses(upExp);
-    persist(income, upFC, upExp, externalRevenues);
-  };
+  const delFixed = id => update({
+    fixedCustom: fixedCustom.filter(f => f.id !== id),
+    expenses: expenses.filter(e => e.catId !== id),
+  });
 
   const addExternal = () => {
     if (Number(extForm.amount) <= 0) return;
     const label = extForm.source === "Autre" ? extForm.customSource || "Autre" : extForm.source;
-    const r = { id:Date.now(), amount:Number(extForm.amount), source:label, date:new Date().toISOString() };
-    const updated = [...externalRevenues, r];
-    setExternalRevenues(updated);
-    persist(income, fixedCustom, expenses, updated);
+    const r = { id:Date.now(), amount:Number(extForm.amount), source:label, date:entryDate() };
+    update({ externalRevenues:[...externalRevenues, r] });
     setExtForm({ amount:"", source:"inDrive", customSource:"" });
     setShowAddExt(false);
   };
 
-  const delExternal = id => {
-    const updated = externalRevenues.filter(r => r.id !== id);
-    setExternalRevenues(updated);
-    persist(income, fixedCustom, expenses, updated);
+  const delExternal = id => update({ externalRevenues: externalRevenues.filter(r => r.id !== id) });
+
+  const updateGoals = next => { setGoals(next); saveGoals(next); };
+
+  const downloadBackup = () => {
+    const blob = new Blob([JSON.stringify(exportAll(), null, 2)], { type:"application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `budget-sauvegarde-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setBackupMsg({ ok:true, text:"Sauvegarde téléchargée." });
+  };
+
+  const restoreBackup = async file => {
+    try {
+      const n = importAll(JSON.parse(await file.text()));
+      setData(loadMonth(year, month));
+      setLearned(loadLearned());
+      setGoals(loadGoals());
+      setBackupMsg({ ok:true, text:`${n} élément${n > 1 ? "s" : ""} restauré${n > 1 ? "s" : ""}.` });
+    } catch (err) {
+      setBackupMsg({ ok:false, text: err instanceof SyntaxError ? "Fichier illisible." : err.message });
+    }
   };
 
   const prevM = () => { if(month===0){setYear(y=>y-1);setMonth(11);}else setMonth(m=>m-1); };
   const nextM = () => { if(month===11){setYear(y=>y+1);setMonth(0);}else setMonth(m=>m+1); };
   const fmtDate = iso => { const d=new Date(iso); return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0,3)}`; };
-
-  // ── Styles ────────────────────────────────────────────────────────────────
-  const g = {
-    app:    { background:"#08080F", minHeight:"100vh", fontFamily:"'Inter',system-ui,sans-serif", color:"#fff", maxWidth:430, margin:"0 auto", paddingBottom:110 },
-    hdr:    { background:"#08080F", padding:"14px 18px 10px", position:"sticky", top:0, zIndex:20, borderBottom:"1px solid #1A1A28" },
-    hero:   { margin:"14px 14px 0", background:"linear-gradient(135deg,#101020,#181830)", borderRadius:22, padding:"18px 20px", border:"1px solid #222238" },
-    card:   { background:"#101020", borderRadius:16, padding:"13px 15px", marginBottom:9, border:"1px solid #1A1A28" },
-    sec:    { padding:"14px 14px 0" },
-    tabBar: { display:"flex", margin:"14px 14px 0", gap:7 },
-    tabBtn: a => ({ flex:1, padding:"9px 4px", border:"none", borderRadius:10, cursor:"pointer", fontWeight:600, fontSize:11, background:a?"#C9A84C":"#131320", color:a?"#08080F":"#6666AA", letterSpacing:0.3 }),
-    overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.8)", zIndex:200, display:"flex", alignItems:"flex-end" },
-    modal:  { background:"#101020", borderRadius:"22px 22px 0 0", padding:"24px 20px", width:"100%", maxWidth:430, margin:"0 auto", border:"1px solid #222238", boxSizing:"border-box" },
-    inp:    { width:"100%", background:"#08080F", border:"1px solid #222238", borderRadius:11, padding:"11px 13px", color:"#fff", fontSize:15, marginBottom:13, boxSizing:"border-box", outline:"none" },
-    sel:    { width:"100%", background:"#08080F", border:"1px solid #222238", borderRadius:11, padding:"11px 13px", color:"#fff", fontSize:14, marginBottom:13, boxSizing:"border-box", outline:"none" },
-    lbl:    { color:"#6666AA", fontSize:10, marginBottom:5, display:"block", textTransform:"uppercase", letterSpacing:1.2 },
-    fab:    { position:"fixed", bottom:24, right:18, width:54, height:54, borderRadius:"50%", background:"#C9A84C", border:"none", color:"#08080F", fontSize:26, cursor:"pointer", boxShadow:"0 4px 24px rgba(201,168,76,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100 },
-    fab2:   { position:"fixed", bottom:24, right:84,  width:54, height:54, borderRadius:"50%", background:"#131320", border:"1px solid #222238", color:"#C9A84C", fontSize:20, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100 },
-    fab3:   { position:"fixed", bottom:24, right:150, width:54, height:54, borderRadius:"50%", background:"#131320", border:"1px solid #222238", color:"#4CAF7D", fontSize:20, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100 },
-    badge:  bg => ({ fontSize:9, fontWeight:700, letterSpacing:1, padding:"2px 7px", borderRadius:99, background:bg+"22", color:bg, border:`1px solid ${bg}44`, display:"inline-block" }),
-    row:    { display:"flex", alignItems:"center", justifyContent:"space-between" },
-    sh:     { fontSize:10, fontWeight:700, letterSpacing:1.5, color:"#6666AA", textTransform:"uppercase", marginBottom:10, marginTop:4 },
-  };
 
   return (
     <div style={g.app}>
@@ -269,7 +187,7 @@ export default function App() {
           <span style={{ fontSize:20 }}>⚠️</span>
           <div>
             <div style={{ fontWeight:700, fontSize:13, color:"#E07B4C" }}>Mode réduit activé</div>
-            <div style={{ fontSize:11, color:"#8888AA", marginTop:2 }}>Revenu &lt; 2 200 MAD — priorité aux essentiels.</div>
+            <div style={{ fontSize:11, color:"#8888AA", marginTop:2 }}>Revenu &lt; {fmt(THRESHOLD)} MAD — priorité aux essentiels.</div>
           </div>
         </div>
       )}
@@ -316,9 +234,11 @@ export default function App() {
         </div>
       </div>
 
+      <PulseCard forecast={forecast} month={month} onSimulate={() => setShowSim(true)}/>
+
       {/* ── TABS ───────────────────────────── */}
-      <div style={g.tabBar}>
-        {[["budget","Budget"],["history","Dépenses"],["external","Revenus +"],["fixed","Charges"],["summary","Bilan"]].map(([k,l]) => (
+      <div className="tabs" style={g.tabBar}>
+        {[["budget","Budget"],["history","Dépenses"],["goals","Objectifs"],["external","Revenus +"],["fixed","Charges"],["summary","Bilan"]].map(([k,l]) => (
           <button key={k} style={g.tabBtn(tab===k)} onClick={() => setTab(k)}>{l}</button>
         ))}
       </div>
@@ -329,6 +249,9 @@ export default function App() {
       {tab==="budget" && (
         <div style={g.sec}>
           <div style={g.sh}>🔒 Charges fixes — {round10(totalFixed)} MAD</div>
+          {data.inherited && fixedCustom.length > 0 && (
+            <div style={{ fontSize:11, color:"#6666AA", marginTop:-6, marginBottom:10 }}>↻ Charges et revenu repris du mois précédent.</div>
+          )}
           {allFixed.map(f => {
             const s = spentMap[f.id]||0, p = s/f.amount;
             return (
@@ -377,10 +300,15 @@ export default function App() {
                     <div style={{ fontSize:11, color:"#6666AA" }}>/ {c.budget} MAD</div>
                   </div>
                 </div>
-                <Bar pct={p} color={c.color}/>
+                <Bar pct={p} color={c.color} marker={c.id !== "epargne" ? paceMarker : null}/>
               </div>
             );
           })}
+          {paceMarker != null && (
+            <div style={{ fontSize:10, color:"#444466", textAlign:"center", margin:"4px 0 2px" }}>
+              ▏ repère blanc = où tu devrais être aujourd'hui pour finir le mois pile
+            </div>
+          )}
         </div>
       )}
 
@@ -414,6 +342,8 @@ export default function App() {
           })}
         </div>
       )}
+
+      {tab==="goals" && <GoalsTab goals={goals} months={listMonths()} onChange={updateGoals}/>}
 
       {/* ════════════════════════════════
           REVENUS EXTERNES TAB
@@ -568,24 +498,48 @@ export default function App() {
               );
             })}
           </div>
+          <div style={g.card}>
+            <div style={{ fontWeight:700, fontSize:13, marginBottom:4 }}>💾 Sauvegarde</div>
+            <div style={{ fontSize:11, color:"#6666AA", marginBottom:11, lineHeight:1.6 }}>
+              Tes données restent sur cet appareil uniquement. Vider le navigateur les efface : exporte-les régulièrement.
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={downloadBackup} style={{ ...g.btnGhost, color:"#C9A84C" }}>⬇ Exporter</button>
+              <button onClick={() => fileRef.current?.click()} style={{ ...g.btnGhost, color:"#7B8CDE" }}>⬆ Restaurer</button>
+              <input ref={fileRef} type="file" accept="application/json,.json" style={{ display:"none" }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) restoreBackup(f); e.target.value = ""; }}/>
+            </div>
+            {backupMsg && <div style={{ fontSize:12, marginTop:9, color:backupMsg.ok ? "#4CAF7D" : "#E05555" }}>{backupMsg.text}</div>}
+          </div>
         </div>
       )}
 
       {/* ── FABs ───────────────────────────── */}
       <button style={g.fab3} onClick={()=>setShowAddExt(true)}   title="Revenu externe">💸</button>
       <button style={g.fab2} onClick={()=>setShowAddFixed(true)} title="Charge fixe">⊕</button>
-      <button style={g.fab}  onClick={()=>setShowAddExp(true)}>+</button>
+      <button style={g.fab}  onClick={()=>openExpense()} title="Dépense">+</button>
 
       {/* ── MODAL : DÉPENSE ─────────────────── */}
       {showAddExp && (
         <div style={g.overlay} onClick={()=>setShowAddExp(false)}>
           <div style={g.modal} onClick={e=>e.stopPropagation()}>
             <div style={{ fontWeight:800, fontSize:17, marginBottom:18 }}>➕ Nouvelle dépense</div>
+            <label style={g.lbl}>⚡ Saisie rapide</label>
+            <input style={{ ...g.inp, borderColor:"#C9A84C66" }} type="text" placeholder="ex : 45 café avec Sara"
+              value={form.quick} onChange={e=>onQuickChange(e.target.value)}
+              onKeyDown={e=>e.key==="Enter" && addExpense()} autoFocus={!form.amount}/>
             <label style={g.lbl}>Montant (MAD)</label>
-            <input style={g.inp} type="number" placeholder="0" value={form.amount}
-              onChange={e=>setForm({...form,amount:e.target.value})} autoFocus/>
-            <label style={g.lbl}>Catégorie</label>
-            <select style={g.sel} value={form.catId} onChange={e=>setForm({...form,catId:e.target.value})}>
+            <input style={g.inp} type="number" inputMode="decimal" placeholder="0" value={form.amount}
+              onChange={e=>setForm({...form,amount:e.target.value})} autoFocus={!!form.amount}/>
+            <label style={g.lbl}>
+              Catégorie
+              {form.guess && !form.catTouched && (
+                <span style={{ color:"#C9A84C", textTransform:"none", letterSpacing:0, marginLeft:6 }}>
+                  · {form.guess === "learned" ? "🧠 d'après tes habitudes" : "✨ devinée"}
+                </span>
+              )}
+            </label>
+            <select style={g.sel} value={form.catId} onChange={e=>setForm({...form,catId:e.target.value,catTouched:true})}>
               <optgroup label="🔒 Charges fixes">
                 {allFixed.map(f=><option key={f.id} value={f.id}>{f.icon} {f.label}</option>)}
               </optgroup>
@@ -596,6 +550,9 @@ export default function App() {
             <label style={g.lbl}>Note (optionnel)</label>
             <input style={g.inp} type="text" placeholder="ex: Lunch, Taxi..." value={form.note}
               onChange={e=>setForm({...form,note:e.target.value})}/>
+            <div style={{ fontSize:10, color:"#444466", marginTop:-6, marginBottom:13 }}>
+              La note sert à apprendre tes catégories : plus tu notes, mieux la saisie rapide devine.
+            </div>
             <div style={{ display:"flex", gap:9 }}>
               <button onClick={()=>setShowAddExp(false)} style={{ flex:1,padding:13,background:"#131320",border:"none",borderRadius:11,color:"#6666AA",fontWeight:700,cursor:"pointer" }}>Annuler</button>
               <button onClick={addExpense} style={{ flex:2,padding:13,background:"#C9A84C",border:"none",borderRadius:11,color:"#08080F",fontWeight:800,cursor:"pointer" }}>Ajouter</button>
@@ -673,6 +630,16 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* ── MODAL : SIMULATEUR ─────────────── */}
+      {showSim && (
+        <SimulatorModal allCats={allCats} spentMap={spentMap} forecast={forecast}
+          onClose={() => setShowSim(false)}
+          onCommit={({ amount, catId }) => {
+            setShowSim(false);
+            openExpense({ amount:String(amount), catId, catTouched:true });
+          }}/>
       )}
 
     </div>
